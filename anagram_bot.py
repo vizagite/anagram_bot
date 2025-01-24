@@ -5,11 +5,50 @@ import string
 import numpy as np
 import asyncio
 import csv
+import math
 from collections import defaultdict, Counter
 
 # set of other possible valid words for same letters as anagram words. other permutations
 with open("other_possible_answers", 'r') as f:
     other_possible_words = set(f.read().splitlines())
+
+def simplified_levenshtein(word1, word2):
+    len1, len2 = len(word1), len(word2)
+    dp = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+
+    # Initialize the first row and column
+    for i in range(len1 + 1):
+        dp[i][0] = i
+    for j in range(len2 + 1):
+        dp[0][j] = j
+
+    # Fill the matrix
+    for i in range(1, len1 + 1):
+        for j in range(1, len2 + 1):
+            if word1[i - 1] == word2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]  # No operation needed
+            else:
+                dp[i][j] = min(
+                    dp[i - 1][j] + 1,      # Deletion
+                    dp[i][j - 1] + 1,      # Insertion
+                    dp[i - 1][j - 1] + 1   # Substitution
+                )
+    if dp[len1][len2] == 1:
+        # Backtrack to find the edit
+        i, j = len1, len2
+        while i > 0 and j > 0:
+            if word1[i - 1] == word2[j - 1]:
+                i -= 1
+                j -= 1
+            else:
+                if dp[i][j] == dp[i - 1][j] + 1:
+                    return dp[i][j], word2[j]  # Deletion
+                else:
+                    return dp[i][j], word2[j - 1]  # Substitution
+        if i > 0:
+            return dp[i][j], word2[j]  # Deletion
+
+    return dp[len1][len2], None  # No single-letter edit 
  
 class AnagramDatabaseHandler:
     def __init__(self, supabase_client):
@@ -192,23 +231,23 @@ class AnagramGame:
             "start_time": datetime.now(),
             "hint1_sent": False,
             "hint2_sent": False, 
-            "cooldown_adjusted": False, 
+            "cooldown_adjusted": False,
+            "other_answers": {}
         }
         self.game_state[server_id] = game_state
         return game_state
-    def check_hints(self, guess, anagram):
-        if sorted(guess) == sorted(anagram):
-            if guess in other_possible_words:
-                return True, "You got 20 points for finding anagram but not exact answer. Think again"
-            else:
-                return False, "Please check typos"
-        elif len(guess) == len(anagram)-1:
-            guess_counter = Counter(guess)
-            anagram_counter = Counter(anagram)
-            missing_letter = (anagram_counter - guess_counter).most_common(1)[0][0]
-            return False, missing_letter # to react easily for missing letter typos
-        return False, None
-        
+    
+    def check_hints(self, guess, word):
+        if guess in other_possible_words and guess not in self.game_state[server_id]["other_answers"]:
+            self.game_state[server_id]["other_answers"].add(guess)
+            return True, "You got 20 points for finding anagram but not exact answer. Think again"
+        distance, edit_letter = simplified_levenshtein(guess, word)
+        if distance >2 : 
+            return False, None
+        elif edit_letter:
+            return False, edit_letter # to react easily for missing letter typos
+        return False, "Please check typos"
+
     async def check_guess(self, user_id: int, server_id: int, guess: str, guess_time: float):
         user_key = self.get_user_key(user_id, server_id)
         game_state = self.game_state[server_id]
@@ -230,7 +269,7 @@ class AnagramGame:
 
             multiplier_answer_not_first = 1
             self.recent_answers[server_id].append((user_id, guess_time))
-            # handle users whose network maybe slow and users who could be on mobile (dont cheat) with exact timestamps 
+            # handle users whose network maybe slow and users who could be on mobile (dont cheat) with exact timestamps
             if len(self.recent_answers[server_id]) == 1:
                 multiplier_answer_not_first = 1
             elif has_capital and guess_time - self.recent_answers[server_id][0][1] <= 1.2:
@@ -241,7 +280,7 @@ class AnagramGame:
                 return
             
         if not correct:
-            partial_correct, hint = self.check_hints(guess, game_state["anagram"])
+            partial_correct, hint = self.check_hints(guess, game_state["word"])
             if partial_correct:
                 points, acumen = await self.db_handler.get_user_data(user_id, server_id)
                 points += 20
@@ -259,7 +298,7 @@ class AnagramGame:
             if multiplier_answer_not_first == 1 and user_having_streak[0] == user_id:
                 user_having_streak[1] += 1
                 streak = user_having_streak[1]
-            elif multiplier_answer_not_first == 1:
+            elif multiplier_answer_not_first == 1 or not user_having_streak[0]:
                 self.streaks[server_id] = [user_id, 1]
                         
             base_points = game_state["base_points"] 
@@ -275,9 +314,7 @@ class AnagramGame:
             start_time = game_state["start_time"].timestamp()
             elapsed_time = start_time - guess_time
 
-            # new_acumen =  min(100, max(1, int(acumen +  ((240 - elapsed_time) * (100 / (1 + elapsed_time) - acumen))/800)))
-            new_acumen = min(100, max(1, int(acumen + ((240 - elapsed_time) * (100 * (1 - elapsed_time / 240) - acumen)) / 2400)))
-            # await self.db_handler.update_user_data(user_id, server_id, points, new_acumen)
+            new_acumen =  max(1, min(100, int(acumen + 11 - (acumen / 10)- 30 * (1 - math.exp(-0.025 * elapsed_time)))))
 
             self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
             return turn_points, points, streak_bonus, True, new_acumen
