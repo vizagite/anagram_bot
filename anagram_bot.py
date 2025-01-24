@@ -312,8 +312,7 @@ class AnagramGame:
             turn_points = word_points * daily_multiplier * multiplier_answer_not_first
             points += turn_points
             start_time = game_state["start_time"].timestamp()
-            elapsed_time = start_time - guess_time
-
+            elapsed_time = guess_time - start_time
             new_acumen =  max(1, min(100, int(acumen + 11 - (acumen / 10)- 30 * (1 - math.exp(-0.025 * elapsed_time)))))
 
             self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
