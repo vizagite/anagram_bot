@@ -11,44 +11,65 @@ from collections import defaultdict, Counter
 # set of other possible valid words for same letters as anagram words. other permutations
 with open("other_possible_answers", 'r') as f:
     other_possible_words = set(f.read().splitlines())
-
-def simplified_levenshtein(word1, word2):
+    
+def modified_damerau_levenshtein(word1, word2):
     len1, len2 = len(word1), len(word2)
     dp = [[0] * (len2 + 1) for _ in range(len1 + 1)]
 
-    # Initialize the first row and column
     for i in range(len1 + 1):
         dp[i][0] = i
     for j in range(len2 + 1):
         dp[0][j] = j
 
-    # Fill the matrix
     for i in range(1, len1 + 1):
         for j in range(1, len2 + 1):
-            if word1[i - 1] == word2[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]  # No operation needed
-            else:
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1,      # Deletion
-                    dp[i][j - 1] + 1,      # Insertion
-                    dp[i - 1][j - 1] + 1   # Substitution
-                )
-    if dp[len1][len2] == 1:
-        # Backtrack to find the edit
-        i, j = len1, len2
-        while i > 0 and j > 0:
-            if word1[i - 1] == word2[j - 1]:
-                i -= 1
-                j -= 1
-            else:
-                if dp[i][j] == dp[i - 1][j] + 1:
-                    return dp[i][j], word2[j]  # Deletion
-                else:
-                    return dp[i][j], word2[j - 1]  # Substitution
-        if i > 0:
-            return dp[i][j], word2[j]  # Deletion
+            cost = 0 if word1[i-1] == word2[j-1] else 1
+            dp[i][j] = min(
+                dp[i-1][j] + 1,    # Deletion
+                dp[i][j-1] + 1,    # Insertion
+                dp[i-1][j-1] + cost  # Substitution
+            )
+            if i > 1 and j > 1 and word1[i-1] == word2[j-2] and word1[i-2] == word2[j-1]:
+                dp[i][j] = min(dp[i][j], dp[i-2][j-2] + 1)
 
-    return dp[len1][len2], None  # No single-letter edit 
+    distance = dp[len1][len2]
+
+    if distance != 1:
+        return (distance, None)
+
+    len_diff = len1 - len2
+
+    if len1 == len2:
+        transposed = False
+        diff_count = 0
+        i = 0
+        while i < len1:
+            if word1[i] != word2[i]:
+                if i < len1 - 1 and word1[i] == word2[i+1] and word1[i+1] == word2[i]:
+                    transposed = True
+                    diff_count += 1
+                    i += 2
+                else:
+                    diff_count += 1
+                    i += 1
+            else:
+                i += 1
+        if transposed and diff_count == 1:
+            return (1, None)
+        else:
+            for i in range(len1):
+                if word1[i] != word2[i]:
+                    return (1, word2[i])
+    elif len_diff == 1:
+        return (1, None)
+    elif len_diff == -1:
+        for i in range(len2):
+            if i >= len1 or word1[i] != word2[i]:
+                return (1, word2[i])
+        return (1, word2[-1])
+    else:
+        return (2, None)
+
  
 class AnagramDatabaseHandler:
     def __init__(self, supabase_client):
@@ -111,7 +132,6 @@ class AnagramDatabaseHandler:
             }
             for idx, entry in enumerate(result.data)
         ]
-
 
 class AcumenQueue:
     """maintain a queue of active users performances to decide difficulty of next word"""
@@ -232,17 +252,19 @@ class AnagramGame:
             "hint1_sent": False,
             "hint2_sent": False, 
             "cooldown_adjusted": False,
-            "other_answers": {}
+            "other_answers": set()
         }
         self.game_state[server_id] = game_state
         return game_state
     
     def check_hints(self, guess, word, server_id):
-        if guess in other_possible_words and guess not in self.game_state[server_id]["other_answers"]:
+        if (sorted(word) == sorted(guess) and guess in other_possible_words) and guess not in self.game_state[server_id]["other_answers"]:
             self.game_state[server_id]["other_answers"].add(guess)
             return True, "You got 20 points for finding anagram but not exact answer. Think again"
+        elif guess in self.game_state[server_id]["other_answers"]:
+            return False, "Someone already guessed this non-anagram word"
         distance, edit_letter = simplified_levenshtein(guess, word)
-        if distance >2 : 
+        if distance >1 : 
             return False, None
         elif edit_letter:
             return False, edit_letter # to react easily for missing letter typos
@@ -252,7 +274,7 @@ class AnagramGame:
         user_key = self.get_user_key(user_id, server_id)
         game_state = self.game_state[server_id]
         if not game_state: return
-        has_capital = guess[0].isupper()
+        has_capital = guess[0].isupper() if guess else False
         guess = guess.lower()
         correct = game_state["word"] == guess
         user_having_streak = self.streaks[server_id]
@@ -260,21 +282,22 @@ class AnagramGame:
         
         if correct:
             cached_recent_answers = self.recent_answers[server_id]
-            if cached_recent_answers and guess_time - cached_recent_answers[0][1] > 1.2:
+            if cached_recent_answers and guess_time - cached_recent_answers[0][1] > 1.5:
                 cached_recent_answers = [
                     ans for ans in cached_recent_answers
-                    if guess_time - ans[1] <= 1.2
+                    if guess_time - ans[1] <= 1.5
                 ]
                 self.recent_answers[server_id] = cached_recent_answers
 
             multiplier_answer_not_first = 1
             self.recent_answers[server_id].append((user_id, guess_time))
             # handle users whose network maybe slow and users who could be on mobile (dont cheat) with exact timestamps
+            buffer_time = 0.1*len(guess)-0.1*len(guess)*len(guess)//10
             if len(self.recent_answers[server_id]) == 1:
                 multiplier_answer_not_first = 1
-            elif has_capital and guess_time - self.recent_answers[server_id][0][1] <= 1.2:
+            elif has_capital and guess_time - self.recent_answers[server_id][0][1] <= buffer_time+0.3:
                 multiplier_answer_not_first = 0.5
-            elif guess_time - self.recent_answers[server_id][0][1] <= 1.0:
+            elif guess_time - self.recent_answers[server_id][0][1] <= buffer_time:
                 multiplier_answer_not_first =  0.5
             else:
                 return
@@ -309,10 +332,11 @@ class AnagramGame:
             streak_bonus = 42 * (streak // 5) if streak % 5 == 0 else (5 if streak > 5 else 0)
 
             word_points = base_points + streak_bonus 
-            turn_points = word_points * daily_multiplier * multiplier_answer_not_first
+            turn_points = int(word_points * daily_multiplier * multiplier_answer_not_first)
             points += turn_points
             start_time = game_state["start_time"].timestamp()
             elapsed_time = guess_time - start_time
+            if acumen<30 and elapsed_time < 30: acumen += 6 # boost brain braining ones
             new_acumen =  max(1, min(100, int(acumen + 11 - (acumen / 10)- 30 * (1 - math.exp(-0.025 * elapsed_time)))))
 
             self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
