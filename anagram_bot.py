@@ -237,7 +237,7 @@ class AnagramGame:
         self.game_state[server_id] = game_state
         return game_state
     
-    def check_hints(self, guess, word):
+    def check_hints(self, guess, word, server_id):
         if guess in other_possible_words and guess not in self.game_state[server_id]["other_answers"]:
             self.game_state[server_id]["other_answers"].add(guess)
             return True, "You got 20 points for finding anagram but not exact answer. Think again"
@@ -280,7 +280,7 @@ class AnagramGame:
                 return
             
         if not correct:
-            partial_correct, hint = self.check_hints(guess, game_state["word"])
+            partial_correct, hint = self.check_hints(guess, game_state["word"], server_id)
             if partial_correct:
                 points, acumen = await self.db_handler.get_user_data(user_id, server_id)
                 points += 20
