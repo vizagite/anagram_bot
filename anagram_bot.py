@@ -6,7 +6,7 @@ import numpy as np
 import asyncio
 import csv
 import math
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 
 # set of other possible valid words for same letters as anagram words. other permutations
 with open("other_possible_answers", 'r') as f:
@@ -179,6 +179,7 @@ class AnagramGame:
         self.streaks = defaultdict(lambda: [0, 0])  # (server_id) -> [user_id, current streak]
         self.acumen_queues = defaultdict(AcumenQueue)
         self.recent_answers = defaultdict(list) # server_id -> [(user_id, time)]
+        self.recently_chosen_queue = defaultdict(lambda: deque(maxlen=200)) # server_id -> deque of recently chosen words
         LEVEL_BOUNDARIES = [0, 1025, 5924, 14915, 19100] # inferred based on score plot
 
         # precomputed scores from 20k filtered SFW words from wiktionary and Barron GRE. 
@@ -218,23 +219,34 @@ class AnagramGame:
 
     def generate_hints(self, word: str, anagram: str) -> Tuple[str, str]:
         # keep one letter in correct position
-        first_hint = list(anagram)
-        first_hint.remove(word[0])
-        first_hint.insert(0, f"**{word[0]}**")
-        first_hint = ''.join(first_hint)
+        first_hint_list = list(anagram)
+        first_letter = word[0]
+        first_hint_list.remove(first_letter)
+        first_hint_list.insert(0, f"**{first_letter}**")
+        first_hint = ''.join(first_hint_list)
+        
+        second_hint_list = list(first_hint_list)
+        last_letter = word[-1]
+        second_hint_list.pop(len(second_hint_list) - 1 - second_hint_list[::-1].index(last_letter))
+        second_hint_list.append(f"**{last_letter}**")
+        second_hint = ''.join(second_hint_list)
 
-        second_hint = list(first_hint)
-        second_hint.remove(word[-1])
-        second_hint.append(f"**{word[-1]}**")
-        second_hint = ''.join(second_hint)
-        return first_hint, second_hint
-    
+        return first_hint, second_hint        
+
     async def generate_anagram(self, server_id: int):
-        acumen_level = self.acumen_queues[server_id].get_dynamic_acumen()
+        # acumen_level = self.acumen_queues[server_id].get_dynamic_acumen()
+        acumen_level = int(random.gauss(40, 30)) #center around 40 acumen
+        
         word_level = min(5, max(1, int(acumen_level/20)))
-        # pick new word dynamically based on acumen
+        
         word_info = random.choice(self.words_levels[word_level])
         word, base_points, definition = word_info
+        
+        while word in self.recently_chosen_queue[server_id]:
+            word_info = random.choice(self.words_levels[word_level])
+            word, base_points, definition = word_info
+        self.recently_chosen_queue[server_id].append(word)
+
         anagram = self.word_shuffle(word)
         is_bomb = random.randint(1, 100) == 1
         first_hint, second_hint = self.generate_hints(word, anagram)
@@ -263,7 +275,7 @@ class AnagramGame:
             return True, "You got 20 points for finding anagram but not exact answer. Think again"
         elif guess in self.game_state[server_id]["other_answers"]:
             return False, "Someone already guessed this non-anagram word"
-        distance, edit_letter = simplified_levenshtein(guess, word)
+        distance, edit_letter = modified_damerau_levenshtein(guess, word)
         if distance >1 : 
             return False, None
         elif edit_letter:
@@ -330,16 +342,17 @@ class AnagramGame:
                 daily_multiplier = 2
                 self.powerups[user_key] -= 1
             streak_bonus = 42 * (streak // 5) if streak % 5 == 0 else (5 if streak > 5 else 0)
-
+            start_time = game_state["start_time"].timestamp()
+            elapsed_time = guess_time - start_time
+            base_points = base_points * .99816 ** elapsed_time
             word_points = base_points + streak_bonus 
             turn_points = int(word_points * daily_multiplier * multiplier_answer_not_first)
             points += turn_points
-            start_time = game_state["start_time"].timestamp()
-            elapsed_time = guess_time - start_time
             if acumen<30 and elapsed_time < 30: acumen += 6 # boost brain braining ones
+            # TODO adjust acumen wrt hardness of word
             new_acumen =  max(1, min(100, int(acumen + 11 - (acumen / 10)- 30 * (1 - math.exp(-0.025 * elapsed_time)))))
 
-            self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
+            # self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
             return turn_points, points, streak_bonus, True, new_acumen
         
         return None
@@ -362,14 +375,14 @@ class AnagramGame:
 
 class CooldownManager:
     def __init__(self):
-        self.base_cooldown = 180
-        self.min_cooldown = 15
+        self.base_cooldown = 240
+        self.min_cooldown = 20
         self.max_cooldown = 900
         self.cooldowns = defaultdict(lambda: self.base_cooldown)
         self.miss_counts = defaultdict(int)
         
     def adjust_cooldown(self, server_id: int, correct: bool):
-        if self.cooldowns[server_id] == 900:
+        if self.cooldowns[server_id] == 900 and correct:
             self.miss_counts[server_id] = 2
             self.cooldowns[server_id] = self.base_cooldown
         if correct:
@@ -388,6 +401,6 @@ class CooldownManager:
                 # Linear increase for incorrect answers
                 self.cooldowns[server_id] = int(min(
                     self.max_cooldown,
-                    self.cooldowns[server_id] * 1.2
+                    self.cooldowns[server_id] * 1.3
                 ))
         return self.cooldowns[server_id]
