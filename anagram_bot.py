@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Tuple
 import random
+import re
 import string
 import numpy as np
 import asyncio
@@ -11,7 +12,17 @@ from collections import defaultdict, Counter, deque
 # set of other possible valid words for same letters as anagram words. other permutations
 with open("other_possible_answers", 'r') as f:
     other_possible_words = set(f.read().splitlines())
+
+def clean_iso_string(iso_string):
+    iso_string = re.sub(r'([+-]\d{2}:\d{2})$', '', iso_string)
     
+    if '.' in iso_string:
+        parts = iso_string.split('.')
+        fractional_seconds = parts[1]
+        if len(fractional_seconds) < 6:
+            iso_string = f'{parts[0]}.{fractional_seconds.ljust(6, "0")}'
+    return iso_string
+
 def modified_damerau_levenshtein(word1, word2):
     len1, len2 = len(word1), len(word2)
     dp = [[0] * (len2 + 1) for _ in range(len1 + 1)]
@@ -70,7 +81,6 @@ def modified_damerau_levenshtein(word1, word2):
     else:
         return (2, None)
 
- 
 class AnagramDatabaseHandler:
     def __init__(self, supabase_client):
         self.db = supabase_client
@@ -181,6 +191,8 @@ class AnagramGame:
         self.recent_answers = defaultdict(list) # server_id -> [(user_id, time)]
         self.recently_chosen_queue = defaultdict(lambda: deque(maxlen=200)) # server_id -> deque of recently chosen words
         LEVEL_BOUNDARIES = [0, 1025, 5924, 14915, 19100] # inferred based on score plot
+        self.state_locks = defaultdict(asyncio.Lock)
+        self.hint_locks = defaultdict(asyncio.Lock)
 
         # precomputed scores from 20k filtered SFW words from wiktionary and Barron GRE. 
         # computed from components of crpytanalysis letter frequency, scrabble score, brute-force combinations, length of word, and frequency of encountering such word on internet.
@@ -205,6 +217,35 @@ class AnagramGame:
                     self.words_levels[4].append(word_info)
                 else:
                     self.words_levels[5].append(word_info)
+
+    async def transition_to_new_game(self, server_id: int, channel, time_to_sleep=0, timeout = False):
+        async with self.state_locks[server_id]:
+            old_state = self.game_state.get(server_id, {})
+            self.game_state[server_id] = {}
+            
+            if time_to_sleep > 0 and timeout:
+                await channel.send(f"⌛ Time's up! The word was **[{old_state['word']}](https://en.wiktionary.org/wiki/{old_state['word']})**: {old_state['def']}\nNext word in {time_to_sleep} seconds\n---")
+                await asyncio.sleep(time_to_sleep)
+            elif time_to_sleep > 0:
+                await asyncio.sleep(time_to_sleep)
+                
+            new_game = await self.generate_anagram(server_id)
+            self.game_state[server_id] = new_game
+            await channel.send(f"### New anagram:\n{new_game['anagram']}\n" + 
+                             ("💣💣💣" if new_game["is_bomb"] else "---"))
+            return new_game
+    
+    async def send_hint(self, server_id: int, hint_type: int):
+        async with self.state_locks[server_id]:
+            game_state = self.game_state.get(server_id)
+            if not game_state:
+                return
+            hint_key = f"hint{hint_type}_sent"
+            hint_text_key = f"{'first' if hint_type == 1 else 'second'}_hint"
+
+            if not game_state.get(hint_key) and game_state.get(hint_text_key):
+                await channel.send(f"### Hint {hint_type}: \n{game_state[hint_text_key]}\n---")
+                game_state[hint_key] = True  # Mark hint as sent
 
 
     def get_user_key(self, user_id: int, server_id: int) -> tuple:
@@ -284,79 +325,82 @@ class AnagramGame:
 
     async def check_guess(self, user_id: int, server_id: int, guess: str, guess_time: float):
         user_key = self.get_user_key(user_id, server_id)
-        game_state = self.game_state[server_id]
-        if not game_state: return
-        has_capital = guess[0].isupper() if guess else False
-        guess = guess.lower()
-        correct = game_state["word"] == guess
-        user_having_streak = self.streaks[server_id]
-        daily_multiplier = 1
-        
-        if correct:
-            cached_recent_answers = self.recent_answers[server_id]
-            if cached_recent_answers and guess_time - cached_recent_answers[0][1] > 1.5:
-                cached_recent_answers = [
-                    ans for ans in cached_recent_answers
-                    if guess_time - ans[1] <= 1.5
-                ]
-                self.recent_answers[server_id] = cached_recent_answers
+        async with self.state_locks[server_id]:
+            game_state = self.game_state[server_id]
+            if not game_state or 'word' not in game_state: return
+            has_capital = guess[0].isupper() if guess else False
+            guess = guess.lower()
+            correct = game_state["word"] == guess
+            user_having_streak = self.streaks[server_id]
+            daily_multiplier = 1
+            
+            if correct:
+                cached_recent_answers = self.recent_answers[server_id]
+                if cached_recent_answers and guess_time - cached_recent_answers[0][1] > 1.5:
+                    cached_recent_answers = [
+                        ans for ans in cached_recent_answers
+                        if guess_time - ans[1] <= 1.5
+                    ]
+                    self.recent_answers[server_id] = cached_recent_answers
 
-            multiplier_answer_not_first = 1
-            self.recent_answers[server_id].append((user_id, guess_time))
-            # handle users whose network maybe slow and users who could be on mobile (dont cheat) with exact timestamps
-            buffer_time = 0.1*len(guess)-0.1*len(guess)*len(guess)//10
-            if len(self.recent_answers[server_id]) == 1:
                 multiplier_answer_not_first = 1
-            elif has_capital and guess_time - self.recent_answers[server_id][0][1] <= buffer_time+0.3:
-                multiplier_answer_not_first = 0.5
-            elif guess_time - self.recent_answers[server_id][0][1] <= buffer_time:
-                multiplier_answer_not_first =  0.5
+                self.recent_answers[server_id].append((user_id, guess_time))
+                # handle users whose network maybe slow and users who could be on mobile (dont cheat) with exact timestamps
+                buffer_time = 0.1*len(guess)-0.1*len(guess)*len(guess)//10
+                if len(self.recent_answers[server_id]) == 1:
+                    multiplier_answer_not_first = 1
+                elif has_capital and guess_time - self.recent_answers[server_id][0][1] <= buffer_time+0.3:
+                    multiplier_answer_not_first = 0.5
+                elif guess_time - self.recent_answers[server_id][0][1] <= buffer_time:
+                    multiplier_answer_not_first =  0.5
+                else:
+                    return
+                
+            if not correct:
+                partial_correct, hint = self.check_hints(guess, game_state["word"], server_id)
+                if partial_correct:
+                    points, acumen = await self.db_handler.get_user_data(user_id, server_id)
+                    points += 20
+                    await self.db_handler.update_user_data_pts(user_id, server_id, points)
+                    return 20, hint
+                elif hint:
+                    return 0, hint 
+                else:
+                    return 0, None
+                
             else:
-                return
-            
-        if not correct:
-            partial_correct, hint = self.check_hints(guess, game_state["word"], server_id)
-            if partial_correct:
                 points, acumen = await self.db_handler.get_user_data(user_id, server_id)
-                points += 20
-                await self.db_handler.update_user_data_pts(user_id, server_id, points)
-                return 20, hint
-            elif hint:
-                return 0, hint 
-            else:
-                return 0, None
+
+                streak = 1
+                if multiplier_answer_not_first == 1 and user_having_streak[0] == user_id:
+                    user_having_streak[1] += 1
+                    streak = user_having_streak[1]
+                elif multiplier_answer_not_first == 1 or not user_having_streak[0]:
+                    self.streaks[server_id] = [user_id, 1]
+                            
+                base_points = game_state["base_points"] 
             
-        else:
-            points, acumen = await self.db_handler.get_user_data(user_id, server_id)
+                if self.powerups[user_key] > 0:
+                    daily_multiplier = 2
+                    self.powerups[user_key] -= 1
+                streak_bonus = 42 * (streak // 5) if streak % 5 == 0 else (5 if streak > 5 else 0)
+                start_time = game_state["start_time"].timestamp()
+                elapsed_time = guess_time - start_time
+                if elapsed_time > 220: elapsed_time = 220
+                base_points = base_points * .99816 ** elapsed_time
+                word_points = base_points + streak_bonus 
+                turn_points = int(word_points * daily_multiplier * multiplier_answer_not_first)
+                points += turn_points
+                if acumen<30 and elapsed_time < 30: acumen += 6 # boost brain braining ones
+                # TODO adjust acumen wrt hardness of word
+                # new_acumen =  max(1, min(100, int(acumen + 11 - (acumen / 10)- 30 * (1 - math.exp(-0.025 * elapsed_time)))))
+                new_acumen =  int(acumen + (elapsed_time - acumen)/100)
 
-            streak = 1
-            if multiplier_answer_not_first == 1 and user_having_streak[0] == user_id:
-                user_having_streak[1] += 1
-                streak = user_having_streak[1]
-            elif multiplier_answer_not_first == 1 or not user_having_streak[0]:
-                self.streaks[server_id] = [user_id, 1]
-                        
-            base_points = game_state["base_points"] 
+                # self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
+                return turn_points, points, streak_bonus, True, new_acumen
+            
+            return None
         
-            if self.powerups[user_key] > 0:
-                daily_multiplier = 2
-                self.powerups[user_key] -= 1
-            streak_bonus = 42 * (streak // 5) if streak % 5 == 0 else (5 if streak > 5 else 0)
-            start_time = game_state["start_time"].timestamp()
-            elapsed_time = guess_time - start_time
-            base_points = base_points * .99816 ** elapsed_time
-            word_points = base_points + streak_bonus 
-            turn_points = int(word_points * daily_multiplier * multiplier_answer_not_first)
-            points += turn_points
-            if acumen<30 and elapsed_time < 30: acumen += 6 # boost brain braining ones
-            # TODO adjust acumen wrt hardness of word
-            new_acumen =  max(1, min(100, int(acumen + 11 - (acumen / 10)- 30 * (1 - math.exp(-0.025 * elapsed_time)))))
-
-            # self.acumen_queues[server_id].add_user_message(user_id, new_acumen, datetime.fromtimestamp(guess_time, tz=timezone.utc))
-            return turn_points, points, streak_bonus, True, new_acumen
-        
-        return None
-    
     async def use_powerup(self, user_id: int, server_id: int):
         user_key = self.get_user_key(user_id, server_id)
         result = await self.db_handler.db.from_("usersanagrams").select("last_powerup").eq("user_id", user_id).eq("server_id", server_id).execute()
@@ -365,7 +409,9 @@ class AnagramGame:
         else:
             return "Please play first! 😒"
         now_ist = datetime.now(self.db_handler.ist)
-        if last_powerup and (now_ist.date() == datetime.fromisoformat(last_powerup).astimezone(self.db_handler.ist).date()):
+        cleaned_last_powerup = clean_iso_string(last_powerup)
+        last_powerup_dt = datetime.fromisoformat(cleaned_last_powerup).astimezone(self.db_handler.ist)
+        if last_powerup and (now_ist.date() == last_powerup_dt.date()):
             return "STML? You have already used powerup today!"
         else:
             last_powerup_timestamp = now_ist.isoformat()
@@ -375,32 +421,34 @@ class AnagramGame:
 
 class CooldownManager:
     def __init__(self):
-        self.base_cooldown = 240
+        self.base_cooldown = 120
         self.min_cooldown = 20
         self.max_cooldown = 900
         self.cooldowns = defaultdict(lambda: self.base_cooldown)
         self.miss_counts = defaultdict(int)
-        
-    def adjust_cooldown(self, server_id: int, correct: bool):
-        if self.cooldowns[server_id] == 900 and correct:
-            self.miss_counts[server_id] = 2
-            self.cooldowns[server_id] = self.base_cooldown
-        if correct:
-            # Exponential decrease for correct answers
-            self.cooldowns[server_id] = max(
-                self.min_cooldown,
-                self.cooldowns[server_id] //2
-            )
-            self.miss_counts[server_id] = 0
-        else:
-            self.miss_counts[server_id] += 1
-            if self.miss_counts[server_id] > 3:
-                # Sleep mode
-                self.cooldowns[server_id] = self.max_cooldown
+        self.cooldown_locks = defaultdict(asyncio.Lock)
+
+    async def adjust_cooldown(self, server_id: int, correct: bool):
+        async with self.cooldown_locks[server_id]:
+            if self.cooldowns[server_id] == 900 and correct:
+                self.miss_counts[server_id] = 2
+                self.cooldowns[server_id] = self.base_cooldown
+            if correct:
+                # Exponential decrease for correct answers
+                self.cooldowns[server_id] = max(
+                    self.min_cooldown,
+                    self.cooldowns[server_id] //2
+                )
+                self.miss_counts[server_id] = 0
             else:
-                # Linear increase for incorrect answers
-                self.cooldowns[server_id] = int(min(
-                    self.max_cooldown,
-                    self.cooldowns[server_id] * 1.3
-                ))
-        return self.cooldowns[server_id]
+                self.miss_counts[server_id] += 1
+                if self.miss_counts[server_id] > 3:
+                    # Sleep mode
+                    self.cooldowns[server_id] = self.max_cooldown
+                else:
+                    # Linear increase for incorrect answers
+                    self.cooldowns[server_id] = int(min(
+                        self.max_cooldown,
+                        self.cooldowns[server_id] * 1.3
+                    ))
+            return self.cooldowns[server_id]
