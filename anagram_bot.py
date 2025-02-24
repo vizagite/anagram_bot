@@ -1,3 +1,4 @@
+import discord
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Tuple
 import random
@@ -14,6 +15,9 @@ with open("other_possible_answers", 'r') as f:
     other_possible_words = set(f.read().splitlines())
 
 def clean_iso_string(iso_string):
+    if iso_string is None:
+        return None
+        
     iso_string = re.sub(r'([+-]\d{2}:\d{2})$', '', iso_string)
     
     if '.' in iso_string:
@@ -193,7 +197,7 @@ class AnagramGame:
         LEVEL_BOUNDARIES = [0, 1025, 5924, 14915, 19100] # inferred based on score plot
         self.state_locks = defaultdict(asyncio.Lock)
         self.hint_locks = defaultdict(asyncio.Lock)
-
+        self.LOCK_TIMEOUT = 2
         # precomputed scores from 20k filtered SFW words from wiktionary and Barron GRE. 
         # computed from components of crpytanalysis letter frequency, scrabble score, brute-force combinations, length of word, and frequency of encountering such word on internet.
         with open('word_score_gloss_sorted.csv', 'r') as file:
@@ -217,34 +221,66 @@ class AnagramGame:
                     self.words_levels[4].append(word_info)
                 else:
                     self.words_levels[5].append(word_info)
-
+    
+    async def acquire_lock(self, server_id: int) -> bool:
+        try:
+            await asyncio.wait_for(self.state_locks[server_id].acquire(), 
+                                 timeout=self.LOCK_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            return False
     async def transition_to_new_game(self, server_id: int, channel, time_to_sleep=0, timeout = False):
-        async with self.state_locks[server_id]:
-            old_state = self.game_state.get(server_id, {})
-            self.game_state[server_id] = {}
+        try:
+            async with self.state_locks[server_id]:
+                old_state = self.game_state.get(server_id, {})
+                self.game_state[server_id] = {}
+        except Exception as e:
+            print(e)            
+        if time_to_sleep > 0 and timeout:
+            await channel.send(f"⌛ Time's up! The word was **[{old_state['word']}](https://en.wiktionary.org/wiki/{old_state['word']})**: {old_state['def']}\nNext word in {time_to_sleep} seconds\n---")
+            await asyncio.sleep(time_to_sleep)
+        elif time_to_sleep > 0:
+            await asyncio.sleep(time_to_sleep)
             
-            if time_to_sleep > 0 and timeout:
-                await channel.send(f"⌛ Time's up! The word was **[{old_state['word']}](https://en.wiktionary.org/wiki/{old_state['word']})**: {old_state['def']}\nNext word in {time_to_sleep} seconds\n---")
-                await asyncio.sleep(time_to_sleep)
-            elif time_to_sleep > 0:
-                await asyncio.sleep(time_to_sleep)
-                
+        async with self.state_locks[server_id]:
             new_game = await self.generate_anagram(server_id)
             self.game_state[server_id] = new_game
-            await channel.send(f"### New anagram:\n{new_game['anagram']}\n" + 
-                             ("💣💣💣" if new_game["is_bomb"] else "---"))
-            return new_game
+
+            embed = discord.Embed(
+                description=f"new anagram",
+                title=new_game['anagram'],
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="💣💣💣" if new_game["is_bomb"] else "")
+        await channel.send(embed=embed)
+        # await channel.send(f"### New anagram:\n{new_game['anagram']}\n" + 
+                            # ("💣💣💣" if new_game["is_bomb"] else "---"))
+        return new_game
     
-    async def send_hint(self, server_id: int, hint_type: int):
+    async def send_hint(self, server_id: int, channel,  hint_type: int):
         async with self.state_locks[server_id]:
             game_state = self.game_state.get(server_id)
             if not game_state:
                 return
             hint_key = f"hint{hint_type}_sent"
             hint_text_key = f"{'first' if hint_type == 1 else 'second'}_hint"
+            text = game_state[hint_text_key]
+            hint_len = len(game_state.get(hint_text_key, ""))
+            if game_state["second_hint"] != game_state["def"]:
+                footer_text = "first letter hint" if hint_type == 1 else "last letter hint"
+            else:
+                footer_text = "definition"
+            embed = discord.Embed(
+                # description=f"hint {hint_type}",
+                description=f"{text}",
+                title=game_state['anagram'],
+                color=discord.Color.red()
+            )
+            embed.set_footer(text=footer_text)
 
             if not game_state.get(hint_key) and game_state.get(hint_text_key):
-                await channel.send(f"### Hint {hint_type}: \n{game_state[hint_text_key]}\n---")
+                await channel.send(embed=embed)
+                # await channel.send(f"### Hint {hint_type}: \n{game_state[hint_text_key]}\n---")
                 game_state[hint_key] = True  # Mark hint as sent
 
 
@@ -410,8 +446,9 @@ class AnagramGame:
             return "Please play first! 😒"
         now_ist = datetime.now(self.db_handler.ist)
         cleaned_last_powerup = clean_iso_string(last_powerup)
-        last_powerup_dt = datetime.fromisoformat(cleaned_last_powerup).astimezone(self.db_handler.ist)
-        if last_powerup and (now_ist.date() == last_powerup_dt.date()):
+        if cleaned_last_powerup:
+            last_powerup_dt = datetime.fromisoformat(cleaned_last_powerup).astimezone(self.db_handler.ist)
+        if cleaned_last_powerup and (now_ist.date() == last_powerup_dt.date()):
             return "STML? You have already used powerup today!"
         else:
             last_powerup_timestamp = now_ist.isoformat()
